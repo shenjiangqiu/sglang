@@ -11,6 +11,7 @@ key (sigmoid+bias) is not the renorm value -> we re-gather the raw logits.
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.moe.gate_topk import (
@@ -113,10 +114,17 @@ def _sigmoid_gate_topk_renorm_kernel(
     active = tl.where(mask_k[None, :], routed_vals, shared)
 
     A: tl.constexpr = K + S
-    probs = tl.sigmoid(active)
     mask_a = offs_a < A
-    probs = tl.where(mask_a[None, :], probs, 0.0)
-    weights = probs / tl.sum(probs, axis=1, keep_dims=True)
+    # Log-domain normalization avoids 0/0 when every sigmoid underflows.
+    log_probs = tl.minimum(active, 0.0) - libdevice.log1p(
+        libdevice.exp(-tl.abs(active))
+    )
+    # Padding must not win the max shift or enter the denominator.
+    log_probs = tl.where(mask_a[None, :], log_probs, float("-inf"))
+    max_log_probs = tl.max(log_probs, axis=1, keep_dims=True)
+    shifted = libdevice.exp(log_probs - max_log_probs)
+    shifted = tl.where(mask_a[None, :], shifted, 0.0)
+    weights = shifted / tl.sum(shifted, axis=1, keep_dims=True)
     weights *= (route_scale * tl.load(global_scale_ptr)).to(weights.dtype)
 
     mask_rk = mask_m[:, None] & mask_k[None, :]

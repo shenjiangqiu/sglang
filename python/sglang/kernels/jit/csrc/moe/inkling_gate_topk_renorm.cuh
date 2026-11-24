@@ -165,17 +165,29 @@ __device__ __forceinline__ void inkling_gate_row(
     sel_raw[k] = __shfl_sync(0xffffffff, win_raw, win_lane);
   }
 
-  // Renorm, replicated on all lanes (registers only, no cross-lane traffic).
-  float active[kInklingTopK + kInklingSharedExperts];
+  // Renorm in the log domain, replicated on all lanes. The max shift keeps the
+  // denominator nonzero for finite logits even when every sigmoid underflows.
+  // logsigmoid(x) = -softplus(-x), and the exact (non fast-math) template keeps
+  // the -100/-300/-1e30 cases stable; the approx path would round them off.
+  static constexpr int kInklingActive = kInklingTopK + kInklingSharedExperts;
+  float active[kInklingActive];
 #pragma unroll
   for (int k = 0; k < kInklingTopK; ++k) {
-    active[k] = device::activation::sigmoid(sel_raw[k]);
+    active[k] = sel_raw[k];
   }
-  active[kInklingTopK + 0] = device::activation::sigmoid(sh0);
-  active[kInklingTopK + 1] = device::activation::sigmoid(sh1);
+  active[kInklingTopK + 0] = sh0;
+  active[kInklingTopK + 1] = sh1;
+
+  float max_logp = -FLT_MAX;
+#pragma unroll
+  for (int i = 0; i < kInklingActive; ++i) {
+    active[i] = -device::activation::softplus<false>(-active[i]);
+    max_logp = fmaxf(max_logp, active[i]);
+  }
   float sum = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kInklingTopK + kInklingSharedExperts; ++i) {
+  for (int i = 0; i < kInklingActive; ++i) {
+    active[i] = device::activation::libdevice::exp(active[i] - max_logp);
     sum += active[i];
   }
   const float scale = st.scale / sum;
@@ -184,7 +196,7 @@ __device__ __forceinline__ void inkling_gate_row(
   float my_active = 0.0f;
   int my_idx = 0;
 #pragma unroll
-  for (int a = 0; a < kInklingTopK + kInklingSharedExperts; ++a) {
+  for (int a = 0; a < kInklingActive; ++a) {
     if (a == lane) {
       my_active = active[a];
       my_idx = a < kInklingTopK ? sel_idx[a] : 0;
@@ -198,7 +210,7 @@ __device__ __forceinline__ void inkling_gate_row(
       routed_w[m * kInklingTopK + lane] = w;
       indices[m * kInklingTopK + lane] = my_idx;
     }
-  } else if (lane < kInklingTopK + kInklingSharedExperts) {
+  } else if (lane < kInklingActive) {
     shared_w[m * kInklingSharedExperts + (lane - kInklingTopK)] = w;
   }
 }
